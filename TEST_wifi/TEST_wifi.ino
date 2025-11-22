@@ -1,21 +1,16 @@
 #include <WiFiS3.h>
 
-// ===== Wi-Fi =====
 const char* WIFI_SSID = "iPhone";      // твой SSID
 const char* WIFI_PASS = "123456789";   // твой пароль
 
-// ===== Modbus TCP =====
 const uint16_t MB_PORT = 502;          // стандартный порт Modbus TCP
 WiFiServer mbServer(MB_PORT);
 
-// ===== Данные =====
 uint16_t hreg0 = 6;  // HR0 всегда 6
 
-// ---- вспомогательные функции ----
 static inline uint16_t be16(const uint8_t* p){ return (uint16_t)p[0] << 8 | p[1]; }
 static inline void wbe16(uint8_t* p, uint16_t v){ p[0] = v >> 8; p[1] = v & 0xFF; }
 
-// ---- обработка клиента ----
 void handleClient(WiFiClient& c){
   uint8_t buf[256];
 
@@ -32,7 +27,6 @@ void handleClient(WiFiClient& c){
     uint8_t* out = buf;
     out[0] = buf[0]; out[1] = buf[1]; out[2] = 0; out[3] = 0; out[6] = unit;
 
-    // --- FC3: Read Holding Registers ---
     if (fc == 3 && len >= 5){
       uint16_t start = be16(&buf[8]);
       uint16_t qty   = be16(&buf[10]);
@@ -47,7 +41,6 @@ void handleClient(WiFiClient& c){
       continue;
     }
 
-    // --- FC6: Write Single Register (optional) ---
     if (fc == 6 && len >= 5){
       uint16_t addr = be16(&buf[8]);
       uint16_t val  = be16(&buf[10]);
@@ -58,7 +51,6 @@ void handleClient(WiFiClient& c){
   }
 }
 
-// ---- подключение Wi-Fi ----
 bool connectWifi(uint32_t timeout_ms = 15000){
   Serial.print("Connecting to "); Serial.println(WIFI_SSID);
   WiFi.disconnect(); delay(300);
