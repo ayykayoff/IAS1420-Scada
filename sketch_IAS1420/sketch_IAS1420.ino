@@ -57,26 +57,41 @@ void updateFanAndRegs()
   float error = temperatureC - setpointC;
   int   targetPWM = 0;
 
-  bool autoMode = (hreg[HR_MODE] != 0);  // 0 = OFF, 1 = AUTO
+  // 1 = AUTO (по температуре), 0 = MANUAL (скорость задаёт потенциометр)
+  bool autoMode = (hreg[HR_MODE] != 0);
 
   if (autoMode) {
-    // existing automatic control logic
+    // --- AUTO: как было ---
     if (error > 0) {
       float ratio = error / FULL_SPEED_SPAN;
       if (ratio > 1.0) ratio = 1.0;
       targetPWM = PWM_MIN + (int)((PWM_MAX - PWM_MIN) * ratio);
       if (targetPWM < PWM_MIN) targetPWM = PWM_MIN;
       if (targetPWM > PWM_MAX) targetPWM = PWM_MAX;
+    } else {
+      targetPWM = 0;
     }
   } else {
-    // control disabled: fan off
-    targetPWM = 0;
+    // --- MANUAL: скорость от потенциометра ---
+    // делаем зону, где вентилятор полностью выключен,
+    // а дальше масштабируем в диапазон PWM_MIN..PWM_MAX
+    float ratio = potValue / 1023.0f;   // 0..1
+
+    if (ratio < 0.05f) {
+      // нижние ~5% хода потенциометра — вентилятор off
+      targetPWM = 0;
+    } else {
+      float r = (ratio - 0.05f) / 0.95f;  // 0..1 после "мертвой зоны"
+      if (r < 0)   r = 0;
+      if (r > 1.0) r = 1.0;
+      targetPWM = PWM_MIN + (int)((PWM_MAX - PWM_MIN) * r);
+    }
   }
 
   analogWrite(enA, targetPWM);
   lastPWM = targetPWM;
 
-  // LED hysteresis
+  // LED hysteresis (оставляем как было — по температуре и setpoint)
   if (!ledOn && (temperatureC > setpointC + LED_HYST)) {
     ledOn = true;
     digitalWrite(ledPin, HIGH);
@@ -85,15 +100,16 @@ void updateFanAndRegs()
     digitalWrite(ledPin, LOW);
   }
 
-  // update Modbus registers (except HR4, it is written from SCADA)
+  // обновляем регистры Modbus
   hreg[HR_SETPOINT] = (uint16_t)(setpointC    * 10.0f);  // HR0
   hreg[HR_TEMP]     = (uint16_t)(temperatureC * 10.0f);  // HR1
-  hreg[HR_PWM]      = (uint16_t)targetPWM;              // HR2
+  hreg[HR_PWM]      = (uint16_t)targetPWM;              // HR2 (фактический PWM)
   hreg[HR_LED]      = ledOn ? 1 : 0;                    // HR3
+  // HR4 (MODE) не трогаем — им рулит SCADA
 
-  // Debug in Serial
+  // Debug в Serial
   Serial.print("MODE: ");
-  Serial.print(autoMode ? "AUTO" : "OFF");
+  Serial.print(autoMode ? "AUTO" : "MANUAL");
   Serial.print(" | SP: ");
   Serial.print(setpointC, 1);
   Serial.print(" C | T: ");
@@ -104,123 +120,165 @@ void updateFanAndRegs()
   Serial.println(ledOn ? "ON" : "OFF");
 }
 
-
 void handleClient(WiFiClient& c){
   uint8_t buf[256];
 
   while (c.connected()){
     updateFanAndRegs();
 
-    if (c.available() < 8){
+    // Ждём хотя бы 7 байт MBAP (Transaction + Protocol + Length + UnitId)
+    if (c.available() < 7){
       delay(1);
       continue;
     }
 
-    int n = c.read(buf, sizeof(buf));
-    if (n < 8) continue;
+    // Читаем 7 байт MBAP
+    int n = c.read(buf, 7);
+    if (n != 7) {
+      // что-то странное, пробуем заново
+      continue;
+    }
 
-    uint16_t len   = (buf[4] << 8) | buf[5];
-    uint8_t  unit  = buf[6];
-    uint8_t  fc    = buf[7];
+    // MBAP: [0..1] TID, [2..3] PID, [4..5] Length (UnitId + PDU), [6] UnitId
+    uint16_t len = be16(&buf[4]);
+    if (len < 2 || len > (sizeof(buf) - 7)) {
+      Serial.println("Bad MBAP length, closing client");
+      break;
+    }
+
+    // len = 1 (UnitId) + PDU_length, но UnitId мы уже прочитали в buf[6]
+    uint16_t pdu_len = len - 1;
+
+    // Ждём, пока придут все байты PDU
+    uint32_t t0 = millis();
+    while (c.available() < pdu_len){
+      if (millis() - t0 > 1000){
+        Serial.println("Timeout waiting PDU, closing client");
+        return;
+      }
+      delay(1);
+    }
+
+    // Читаем PDU (fc + данные)
+    int m = c.read(buf + 7, pdu_len);
+    if (m != pdu_len){
+      // не дочитали — пропускаем
+      continue;
+    }
+
+    uint8_t unit = buf[6];
+    uint8_t fc   = buf[7];
 
     uint8_t* out = buf;
-    out[0] = buf[0];
-    out[1] = buf[1];
+
+    // TransactionId (0..1) и ProtocolId (2..3) оставляем как есть,
+    // но ProtocolId по Modbus TCP = 0
     out[2] = 0;
     out[3] = 0;
-    out[6] = unit;
+    out[6] = unit;  // UnitId
 
-    // --- FC3: Read Holding Registers ---
-    if (fc == 3 && len >= 5){
+    // ---------- FC3: Read Holding Registers ----------
+    if (fc == 3 && pdu_len >= 5) {
       uint16_t start = be16(&buf[8]);   // starting address
       uint16_t qty   = be16(&buf[10]);  // number of registers
 
       if (qty == 0 || (start + qty) > HREG_COUNT){
-        // illegal data address
+        // exception: illegal data address
         out[7] = fc | 0x80;
-        out[8] = 0x02;
-        wbe16(&out[4], 3);           // UnitId + FC + EXC
-        c.write(out, 7 + 3);
+        out[8] = 0x02;  // ILLEGAL DATA ADDRESS
+        uint16_t pdu_resp_len = 2;           // fc + exception code
+        uint16_t len_resp     = 1 + pdu_resp_len; // UnitId + PDU
+        wbe16(&out[4], len_resp);
+        c.write(out, 7 + pdu_resp_len);      // MBAP(7) + PDU
       } else {
-        out[7] = 3;
-        out[8] = qty * 2;
+        out[7] = 3;            // fc
+        out[8] = qty * 2;      // byte count
 
         for (uint16_t i = 0; i < qty; i++){
           wbe16(&out[9 + 2*i], hreg[start + i]);
         }
 
-        // length = UnitId(1) + FC(1) + ByteCount(1) + 2*qty
-        wbe16(&out[4], 3 + 2*qty);
-        c.write(out, 7 + 3 + 2*qty);
+        uint16_t pdu_resp_len = 2 + 2*qty;  // fc + byteCount + data
+        uint16_t len_resp     = 1 + pdu_resp_len; // UnitId + PDU
+        wbe16(&out[4], len_resp);
+        c.write(out, 7 + pdu_resp_len);     // MBAP(7) + PDU
       }
       continue;
     }
 
-    // --- FC6: Write Single Register ---
-  if (fc == 6 && len >= 5){
-    uint16_t addr = be16(&buf[8]);
-    uint16_t val  = be16(&buf[10]);
+    // ---------- FC6: Write Single Register ----------
+    if (fc == 6 && pdu_len >= 5) {
+      uint16_t addr = be16(&buf[8]);
+      uint16_t val  = be16(&buf[10]);
 
-    if (addr < HREG_COUNT){
-      hreg[addr] = val;
+      if (addr < HREG_COUNT){
+        hreg[addr] = val;
 
-      // DEBUG
-      Serial.print("FC6 write HR");
-      Serial.print(addr);
-      Serial.print(" = ");
-      Serial.println(val);
-    }
+        Serial.print("FC6 write HR");
+        Serial.print(addr);
+        Serial.print(" = ");
+        Serial.println(val);
+      }
 
-    c.write(buf, 12);   // echo
-    continue;
-  }
-
-  // --- FC16: Write Multiple Registers ---
-  if (fc == 16 && len >= 6){
-    uint16_t start = be16(&buf[8]);   // starting address
-    uint16_t qty   = be16(&buf[10]);  // how many registers
-    uint8_t  byteCount = buf[12];
-
-    // простая проверка границ
-    if (qty == 0 || (start + qty) > HREG_COUNT || byteCount != qty*2){
-      out[7] = fc | 0x80; // exception
-      out[8] = 0x02;      // illegal data address
-      wbe16(&out[4], 3);
-      c.write(out, 7 + 3);
+      // Ответ по FC6 — эхо: fc + addr + val
+      uint16_t pdu_resp_len = 5;          // fc + addr(2) + val(2)
+      uint16_t len_resp     = 1 + pdu_resp_len; // UnitId + PDU
+      wbe16(&out[4], len_resp);
+      // buf уже содержит fc/addr/val на тех же позициях
+      c.write(out, 7 + pdu_resp_len);     // MBAP(7) + PDU
       continue;
     }
 
-    // payload начинается с buf[13]
-    const uint8_t* p = &buf[13];
-    for (uint16_t i = 0; i < qty; i++){
-      uint16_t v = be16(p + 2*i);
-      hreg[start + i] = v;
+    // ---------- FC16: Write Multiple Registers ----------
+    if (fc == 16 && pdu_len >= 6) {
+      uint16_t start = be16(&buf[8]);   // starting address
+      uint16_t qty   = be16(&buf[10]);  // how many registers
+      uint8_t  byteCount = buf[12];
 
-      // DEBUG
-      Serial.print("FC16 write HR");
-      Serial.print(start + i);
-      Serial.print(" = ");
-      Serial.println(v);
+      if (qty == 0 || (start + qty) > HREG_COUNT || byteCount != qty * 2){
+        out[7] = fc | 0x80;  // exception
+        out[8] = 0x02;       // illegal data address
+        uint16_t pdu_resp_len = 2;           // fc + exception code
+        uint16_t len_resp     = 1 + pdu_resp_len;
+        wbe16(&out[4], len_resp);
+        c.write(out, 7 + pdu_resp_len);
+        continue;
+      }
+
+      const uint8_t* p = &buf[13];
+      for (uint16_t i = 0; i < qty; i++){
+        uint16_t v = be16(p + 2*i);
+        hreg[start + i] = v;
+
+        Serial.print("FC16 write HR");
+        Serial.print(start + i);
+        Serial.print(" = ");
+        Serial.println(v);
+      }
+
+      // Ответ: fc + start + qty
+      out[7]  = 16;
+      out[8]  = (start >> 8) & 0xFF;
+      out[9]  = start & 0xFF;
+      out[10] = (qty >> 8) & 0xFF;
+      out[11] = qty & 0xFF;
+
+      uint16_t pdu_resp_len = 5;           // fc + start(2) + qty(2)
+      uint16_t len_resp     = 1 + pdu_resp_len;
+      wbe16(&out[4], len_resp);
+      c.write(out, 7 + pdu_resp_len);
+      continue;
     }
 
-    // ответ: echo fc, start, qty
-    out[7] = 16;
-    out[8] = (start >> 8) & 0xFF;
-    out[9] = start & 0xFF;
-    out[10] = (qty >> 8) & 0xFF;
-    out[11] = qty & 0xFF;
-
-    wbe16(&out[4], 6);   // length: unit(1)+fc(1)+start(2)+qty(2) = 6
-    c.write(out, 12);
-    continue;
-  }
-
-
-    // Unsupported function → exception
+    // ---------- Unsupported function → exception ----------
     out[7] = fc | 0x80;
-    out[8] = 0x01;
-    wbe16(&out[4], 3);
-    c.write(out, 7 + 3);
+    out[8] = 0x01;  // ILLEGAL FUNCTION
+    {
+      uint16_t pdu_resp_len = 2;           // fc + exc.code
+      uint16_t len_resp     = 1 + pdu_resp_len;
+      wbe16(&out[4], len_resp);
+      c.write(out, 7 + pdu_resp_len);
+    }
   }
 }
 
