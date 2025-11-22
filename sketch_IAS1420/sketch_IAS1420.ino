@@ -12,8 +12,8 @@ static inline void     wbe16(uint8_t* p, uint16_t v){ p[0] = v >> 8; p[1] = v & 
 const int enA    = 9;    // L298N ENA (PWM)
 const int in1    = 8;    // Direction
 const int in2    = 7;    // Direction
-const int potPin = A0;   // Potentiometer -> setpoint (0..100 °C)
-const int tempPin= A1;   // Temperature sensor (0..5V = 0..100 °C)
+const int potPin = A0;   // Potentiometer
+const int tempPin= A1;   // Temperature sensor
 const int ledPin = 2;    // Over-temp LED
 
 const int   PWM_MIN = 245;      // fan starts only from ~240
@@ -25,7 +25,7 @@ const float LED_HYST       = 0.5;
 // HR1: temperatureC * 10
 // HR2: PWM (0..255)
 // HR3: LED (0/1)
-// HR4: MODE (0 = fan OFF, 1 = AUTO temperature control)
+// HR4: MODE command FROM SCADA (0 = MANUAL, 1 = AUTO)
 #define HREG_COUNT 5
 
 #define HR_SETPOINT 0
@@ -37,8 +37,12 @@ const float LED_HYST       = 0.5;
 int   lastPWM = 0;
 bool  ledOn   = false;
 
-// default: AUTO mode enabled (HR4 = 1)
-uint16_t hreg[HREG_COUNT] = {0,0,0,0,1};
+// HR4 starts as 0 (MANUAL by default). Arduino does NOT force it later.
+uint16_t hreg[HREG_COUNT] = {0,0,0,0,0};
+
+// Variable reflecting the switch (from HR4). 0/1 only.
+volatile uint8_t switchCmd = 0;
+uint8_t lastSwitchCmd = 255;
 
 void updateFanAndRegs()
 {
@@ -47,6 +51,17 @@ void updateFanAndRegs()
   if (now - lastUpdate < 100)   // 10 Hz
     return;
   lastUpdate = now;
+
+  // Read switch command ONLY from HR4.
+  // 0 = MANUAL, 1 = AUTO
+  switchCmd = (hreg[HR_MODE] != 0) ? 1 : 0;
+
+  // Print only on change.
+  if (switchCmd != lastSwitchCmd) {
+    lastSwitchCmd = switchCmd;
+    Serial.print("SWITCH CMD (from HR4) = ");
+    Serial.println(switchCmd);  // 0 or 1
+  }
 
   int potValue = analogRead(potPin);   // 0..1023
   int rawTemp  = analogRead(tempPin);  // 0..1023
@@ -57,11 +72,10 @@ void updateFanAndRegs()
   float error = temperatureC - setpointC;
   int   targetPWM = 0;
 
-  // 1 = AUTO (по температуре), 0 = MANUAL (скорость задаёт потенциометр)
-  bool autoMode = (hreg[HR_MODE] != 0);
+  bool autoMode = (switchCmd == 1);  // 1=AUTO, 0=MANUAL
 
   if (autoMode) {
-    // --- AUTO: как было ---
+    // --- AUTO: по температуре ---
     if (error > 0) {
       float ratio = error / FULL_SPEED_SPAN;
       if (ratio > 1.0) ratio = 1.0;
@@ -71,17 +85,16 @@ void updateFanAndRegs()
     } else {
       targetPWM = 0;
     }
+
   } else {
     // --- MANUAL: скорость от потенциометра ---
-    // делаем зону, где вентилятор полностью выключен,
-    // а дальше масштабируем в диапазон PWM_MIN..PWM_MAX
     float ratio = potValue / 1023.0f;   // 0..1
 
     if (ratio < 0.05f) {
-      // нижние ~5% хода потенциометра — вентилятор off
+      // нижние ~5% — почти стоп, но можно оставить 0
       targetPWM = 0;
     } else {
-      float r = (ratio - 0.05f) / 0.95f;  // 0..1 после "мертвой зоны"
+      float r = (ratio - 0.05f) / 0.95f;  // 0..1 после мёртвой зоны
       if (r < 0)   r = 0;
       if (r > 1.0) r = 1.0;
       targetPWM = PWM_MIN + (int)((PWM_MAX - PWM_MIN) * r);
@@ -91,7 +104,7 @@ void updateFanAndRegs()
   analogWrite(enA, targetPWM);
   lastPWM = targetPWM;
 
-  // LED hysteresis (оставляем как было — по температуре и setpoint)
+  // LED hysteresis (по температуре и setpoint)
   if (!ledOn && (temperatureC > setpointC + LED_HYST)) {
     ledOn = true;
     digitalWrite(ledPin, HIGH);
@@ -100,14 +113,14 @@ void updateFanAndRegs()
     digitalWrite(ledPin, LOW);
   }
 
-  // обновляем регистры Modbus
+  // update Modbus registers (except HR4, it is written from SCADA)
   hreg[HR_SETPOINT] = (uint16_t)(setpointC    * 10.0f);  // HR0
   hreg[HR_TEMP]     = (uint16_t)(temperatureC * 10.0f);  // HR1
-  hreg[HR_PWM]      = (uint16_t)targetPWM;              // HR2 (фактический PWM)
+  hreg[HR_PWM]      = (uint16_t)targetPWM;              // HR2
   hreg[HR_LED]      = ledOn ? 1 : 0;                    // HR3
-  // HR4 (MODE) не трогаем — им рулит SCADA
+  // DO NOT touch hreg[HR_MODE] here.
 
-  // Debug в Serial
+  // Debug in Serial
   Serial.print("MODE: ");
   Serial.print(autoMode ? "AUTO" : "MANUAL");
   Serial.print(" | SP: ");
@@ -126,88 +139,51 @@ void handleClient(WiFiClient& c){
   while (c.connected()){
     updateFanAndRegs();
 
-    // Ждём хотя бы 7 байт MBAP (Transaction + Protocol + Length + UnitId)
-    if (c.available() < 7){
+    if (c.available() < 8){
       delay(1);
       continue;
     }
 
-    // Читаем 7 байт MBAP
-    int n = c.read(buf, 7);
-    if (n != 7) {
-      // что-то странное, пробуем заново
-      continue;
-    }
+    int n = c.read(buf, sizeof(buf));
+    if (n < 8) continue;
 
-    // MBAP: [0..1] TID, [2..3] PID, [4..5] Length (UnitId + PDU), [6] UnitId
-    uint16_t len = be16(&buf[4]);
-    if (len < 2 || len > (sizeof(buf) - 7)) {
-      Serial.println("Bad MBAP length, closing client");
-      break;
-    }
-
-    // len = 1 (UnitId) + PDU_length, но UnitId мы уже прочитали в buf[6]
-    uint16_t pdu_len = len - 1;
-
-    // Ждём, пока придут все байты PDU
-    uint32_t t0 = millis();
-    while (c.available() < pdu_len){
-      if (millis() - t0 > 1000){
-        Serial.println("Timeout waiting PDU, closing client");
-        return;
-      }
-      delay(1);
-    }
-
-    // Читаем PDU (fc + данные)
-    int m = c.read(buf + 7, pdu_len);
-    if (m != pdu_len){
-      // не дочитали — пропускаем
-      continue;
-    }
-
-    uint8_t unit = buf[6];
-    uint8_t fc   = buf[7];
+    uint16_t len   = (buf[4] << 8) | buf[5];
+    uint8_t  unit  = buf[6];
+    uint8_t  fc    = buf[7];
 
     uint8_t* out = buf;
-
-    // TransactionId (0..1) и ProtocolId (2..3) оставляем как есть,
-    // но ProtocolId по Modbus TCP = 0
+    out[0] = buf[0];
+    out[1] = buf[1];
     out[2] = 0;
     out[3] = 0;
-    out[6] = unit;  // UnitId
+    out[6] = unit;
 
-    // ---------- FC3: Read Holding Registers ----------
-    if (fc == 3 && pdu_len >= 5) {
-      uint16_t start = be16(&buf[8]);   // starting address
-      uint16_t qty   = be16(&buf[10]);  // number of registers
+    // --- FC3: Read Holding Registers ---
+    if (fc == 3 && len >= 5){
+      uint16_t start = be16(&buf[8]);
+      uint16_t qty   = be16(&buf[10]);
 
       if (qty == 0 || (start + qty) > HREG_COUNT){
-        // exception: illegal data address
         out[7] = fc | 0x80;
-        out[8] = 0x02;  // ILLEGAL DATA ADDRESS
-        uint16_t pdu_resp_len = 2;           // fc + exception code
-        uint16_t len_resp     = 1 + pdu_resp_len; // UnitId + PDU
-        wbe16(&out[4], len_resp);
-        c.write(out, 7 + pdu_resp_len);      // MBAP(7) + PDU
+        out[8] = 0x02;
+        wbe16(&out[4], 3);
+        c.write(out, 7 + 3);
       } else {
-        out[7] = 3;            // fc
-        out[8] = qty * 2;      // byte count
+        out[7] = 3;
+        out[8] = qty * 2;
 
         for (uint16_t i = 0; i < qty; i++){
           wbe16(&out[9 + 2*i], hreg[start + i]);
         }
 
-        uint16_t pdu_resp_len = 2 + 2*qty;  // fc + byteCount + data
-        uint16_t len_resp     = 1 + pdu_resp_len; // UnitId + PDU
-        wbe16(&out[4], len_resp);
-        c.write(out, 7 + pdu_resp_len);     // MBAP(7) + PDU
+        wbe16(&out[4], 3 + 2*qty);
+        c.write(out, 7 + 3 + 2*qty);
       }
       continue;
     }
 
-    // ---------- FC6: Write Single Register ----------
-    if (fc == 6 && pdu_len >= 5) {
+    // --- FC6: Write Single Register ---
+    if (fc == 6 && len >= 5){
       uint16_t addr = be16(&buf[8]);
       uint16_t val  = be16(&buf[10]);
 
@@ -220,28 +196,21 @@ void handleClient(WiFiClient& c){
         Serial.println(val);
       }
 
-      // Ответ по FC6 — эхо: fc + addr + val
-      uint16_t pdu_resp_len = 5;          // fc + addr(2) + val(2)
-      uint16_t len_resp     = 1 + pdu_resp_len; // UnitId + PDU
-      wbe16(&out[4], len_resp);
-      // buf уже содержит fc/addr/val на тех же позициях
-      c.write(out, 7 + pdu_resp_len);     // MBAP(7) + PDU
+      c.write(buf, 12); // echo
       continue;
     }
 
-    // ---------- FC16: Write Multiple Registers ----------
-    if (fc == 16 && pdu_len >= 6) {
-      uint16_t start = be16(&buf[8]);   // starting address
-      uint16_t qty   = be16(&buf[10]);  // how many registers
+    // --- FC16: Write Multiple Registers ---
+    if (fc == 16 && len >= 6){
+      uint16_t start = be16(&buf[8]);
+      uint16_t qty   = be16(&buf[10]);
       uint8_t  byteCount = buf[12];
 
-      if (qty == 0 || (start + qty) > HREG_COUNT || byteCount != qty * 2){
-        out[7] = fc | 0x80;  // exception
-        out[8] = 0x02;       // illegal data address
-        uint16_t pdu_resp_len = 2;           // fc + exception code
-        uint16_t len_resp     = 1 + pdu_resp_len;
-        wbe16(&out[4], len_resp);
-        c.write(out, 7 + pdu_resp_len);
+      if (qty == 0 || (start + qty) > HREG_COUNT || byteCount != qty*2){
+        out[7] = fc | 0x80;
+        out[8] = 0x02;
+        wbe16(&out[4], 3);
+        c.write(out, 7 + 3);
         continue;
       }
 
@@ -256,32 +225,24 @@ void handleClient(WiFiClient& c){
         Serial.println(v);
       }
 
-      // Ответ: fc + start + qty
-      out[7]  = 16;
-      out[8]  = (start >> 8) & 0xFF;
-      out[9]  = start & 0xFF;
+      out[7] = 16;
+      out[8] = (start >> 8) & 0xFF;
+      out[9] = start & 0xFF;
       out[10] = (qty >> 8) & 0xFF;
       out[11] = qty & 0xFF;
 
-      uint16_t pdu_resp_len = 5;           // fc + start(2) + qty(2)
-      uint16_t len_resp     = 1 + pdu_resp_len;
-      wbe16(&out[4], len_resp);
-      c.write(out, 7 + pdu_resp_len);
+      wbe16(&out[4], 6);
+      c.write(out, 12);
       continue;
     }
 
-    // ---------- Unsupported function → exception ----------
+    // Unsupported function → exception
     out[7] = fc | 0x80;
-    out[8] = 0x01;  // ILLEGAL FUNCTION
-    {
-      uint16_t pdu_resp_len = 2;           // fc + exc.code
-      uint16_t len_resp     = 1 + pdu_resp_len;
-      wbe16(&out[4], len_resp);
-      c.write(out, 7 + pdu_resp_len);
-    }
+    out[8] = 0x01;
+    wbe16(&out[4], 3);
+    c.write(out, 7 + 3);
   }
 }
-
 
 bool connectWifi(uint32_t timeout_ms = 15000){
   Serial.print("Connecting to "); Serial.println(WIFI_SSID);
@@ -324,7 +285,7 @@ void setup(){
 }
 
 void loop(){
-  updateFanAndRegs();     
+  updateFanAndRegs();
 
   WiFiClient cli = mbServer.available();
   if (cli){
@@ -335,5 +296,5 @@ void loop(){
     Serial.println("Client disconnected");
   }
 
-  delay(5);            
+  delay(5);
 }
