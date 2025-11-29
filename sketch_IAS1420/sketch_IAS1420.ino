@@ -52,30 +52,30 @@ void updateFanAndRegs()
     return;
   lastUpdate = now;
 
-  // Read switch command ONLY from HR4.
-  // 0 = MANUAL, 1 = AUTO
+  // 0 = MANUAL, 1 = AUTO (из HR4)
   switchCmd = (hreg[HR_MODE] != 0) ? 1 : 0;
+  bool autoMode = (switchCmd == 1);
 
-  // Print only on change.
   if (switchCmd != lastSwitchCmd) {
     lastSwitchCmd = switchCmd;
     Serial.print("SWITCH CMD (from HR4) = ");
     Serial.println(switchCmd);  // 0 or 1
   }
 
-  int potValue = analogRead(potPin);   // 0..1023
-  int rawTemp  = analogRead(tempPin);  // 0..1023
+  int potValue = analogRead(potPin);   // 0..1023 (ручка)
+  int rawTemp  = analogRead(tempPin);  // 0..1023 (датчик)
 
-  float setpointC    = (potValue * 100.0) / 1023.0;  // 0..100°C
-  float temperatureC = (rawTemp  * 100.0) / 1023.0;  // 0..100°C
+  // Температура всегда одна
+  float temperatureC = (rawTemp * 100.0) / 1023.0;  // 0..100°C
+
+  // --- setpoint ВСЕГДА из HR0 (Ignition), и в AUTO, и в MANUAL ---
+  float setpointC = hreg[HR_SETPOINT] / 10.0f;   // HR0 хранится как *10
 
   float error = temperatureC - setpointC;
   int   targetPWM = 0;
 
-  bool autoMode = (switchCmd == 1);  // 1=AUTO, 0=MANUAL
-
   if (autoMode) {
-    // --- AUTO: по температуре ---
+    // --- AUTO: по температуре и setpoint'у из SCADA ---
     if (error > 0) {
       float ratio = error / FULL_SPEED_SPAN;
       if (ratio > 1.0) ratio = 1.0;
@@ -85,16 +85,14 @@ void updateFanAndRegs()
     } else {
       targetPWM = 0;
     }
-
   } else {
-    // --- MANUAL: скорость от потенциометра ---
+    // --- MANUAL: скорость от потенциометра, setpoint НЕ трогаем ---
     float ratio = potValue / 1023.0f;   // 0..1
 
     if (ratio < 0.05f) {
-      // нижние ~5% — почти стоп, но можно оставить 0
       targetPWM = 0;
     } else {
-      float r = (ratio - 0.05f) / 0.95f;  // 0..1 после мёртвой зоны
+      float r = (ratio - 0.05f) / 0.95f;
       if (r < 0)   r = 0;
       if (r > 1.0) r = 1.0;
       targetPWM = PWM_MIN + (int)((PWM_MAX - PWM_MIN) * r);
@@ -104,7 +102,7 @@ void updateFanAndRegs()
   analogWrite(enA, targetPWM);
   lastPWM = targetPWM;
 
-  // LED hysteresis (по температуре и setpoint)
+  // LED по сравнению T и выбранного setpointC
   if (!ledOn && (temperatureC > setpointC + LED_HYST)) {
     ledOn = true;
     digitalWrite(ledPin, HIGH);
@@ -113,14 +111,12 @@ void updateFanAndRegs()
     digitalWrite(ledPin, LOW);
   }
 
-  // update Modbus registers (except HR4, it is written from SCADA)
-  hreg[HR_SETPOINT] = (uint16_t)(setpointC    * 10.0f);  // HR0
-  hreg[HR_TEMP]     = (uint16_t)(temperatureC * 10.0f);  // HR1
-  hreg[HR_PWM]      = (uint16_t)targetPWM;              // HR2
-  hreg[HR_LED]      = ledOn ? 1 : 0;                    // HR3
-  // DO NOT touch hreg[HR_MODE] here.
+  // --- Обновляем регистры Modbus ---
+  hreg[HR_TEMP] = (uint16_t)(temperatureC * 10.0f);  // HR1
+  hreg[HR_PWM]  = (uint16_t)targetPWM;              // HR2
+  hreg[HR_LED]  = ledOn ? 1 : 0;                    // HR3
 
-  // Debug in Serial
+  // Debug
   Serial.print("MODE: ");
   Serial.print(autoMode ? "AUTO" : "MANUAL");
   Serial.print(" | SP: ");
